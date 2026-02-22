@@ -62,8 +62,9 @@ const (
 	// udpSessionTimeout is the default timeout for UDP sessions.
 	udpSessionTimeout = 60 * time.Second
 
-	// Buffer size for copying data
-	bufferSize = 32 * 1024
+	// Buffer size for copying data between connections
+	// Larger buffers reduce syscall overhead at high throughput
+	bufferSize = 256 * 1024 // 256KB
 
 	// icmpTimeout is the default timeout for ICMP ping requests.
 	icmpTimeout = 5 * time.Second
@@ -221,15 +222,22 @@ func setTCPSocketOptions(s *stack.Stack, ep tcpip.Endpoint) {
 
 	ep.SetSockOptInt(tcpip.KeepaliveCountOption, tcpKeepaliveCount)
 
-	// TCP send/recv buffer size
+	// Disable Nagle's algorithm for lower latency
+	// This prevents small packets from being delayed waiting for more data
+	ep.SocketOptions().SetDelayOption(false)
+
+	// Set TCP buffer sizes to stack maximum for high throughput
+	// The stack should be configured with larger buffers (see tun.go)
 	var ss tcpip.TCPSendBufferSizeRangeOption
 	if err := s.TransportProtocolOption(tcp.ProtocolNumber, &ss); err == nil {
-		ep.SocketOptions().SetSendBufferSize(int64(ss.Default), false)
+		// Use the maximum configured buffer size for best throughput
+		ep.SocketOptions().SetSendBufferSize(int64(ss.Max), false)
 	}
 
 	var rs tcpip.TCPReceiveBufferSizeRangeOption
 	if err := s.TransportProtocolOption(tcp.ProtocolNumber, &rs); err == nil {
-		ep.SocketOptions().SetReceiveBufferSize(int64(rs.Default), false)
+		// Use the maximum configured buffer size for best throughput
+		ep.SocketOptions().SetReceiveBufferSize(int64(rs.Max), false)
 	}
 }
 

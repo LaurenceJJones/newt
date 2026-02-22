@@ -105,6 +105,33 @@ func CreateNetTUNWithOptions(localAddresses, dnsServers []netip.Addr, mtu int, o
 	if tcpipErr != nil {
 		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
 	}
+
+	// Configure larger TCP buffer sizes for high throughput
+	// Default gVisor buffers are too small (32KB) for high-bandwidth links
+	// At 160 Mbps with 50ms RTT, we need ~1MB buffers (bandwidth-delay product)
+	tcpSendBufOpt := tcpip.TCPSendBufferSizeRangeOption{
+		Min:     64 * 1024,      // 64KB minimum
+		Default: 512 * 1024,     // 512KB default
+		Max:     4 * 1024 * 1024, // 4MB maximum
+	}
+	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpSendBufOpt); err != nil {
+		return nil, nil, fmt.Errorf("could not set TCP send buffer size: %v", err)
+	}
+
+	tcpRecvBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
+		Min:     64 * 1024,      // 64KB minimum
+		Default: 512 * 1024,     // 512KB default
+		Max:     4 * 1024 * 1024, // 4MB maximum
+	}
+	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecvBufOpt); err != nil {
+		return nil, nil, fmt.Errorf("could not set TCP receive buffer size: %v", err)
+	}
+
+	// Enable receive buffer auto-tuning for dynamic adjustment based on connection needs
+	tcpRecvBufAutoOpt := tcpip.TCPModerateReceiveBufferOption(true)
+	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecvBufAutoOpt); err != nil {
+		return nil, nil, fmt.Errorf("could not enable TCP receive buffer auto-tuning: %v", err)
+	}
 	// Create NIC 1 (main interface, no promiscuous mode)
 	dev.notifyHandle = dev.ep.AddNotify(dev)
 	tcpipErr = dev.stack.CreateNIC(1, dev.ep)
