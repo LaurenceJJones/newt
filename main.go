@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/netip"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -201,6 +203,9 @@ func main() {
 
 // runNewtMain contains the main newt logic, extracted for service support
 func runNewtMain(ctx context.Context) {
+	// Enable mutex and block profiling for pprof
+	runtime.SetMutexProfileFraction(1)
+	runtime.SetBlockProfileRate(1)
 	// if PANGOLIN_ENDPOINT, NEWT_ID, and NEWT_SECRET are set as environment variables, they will be used as default values
 	endpoint = os.Getenv("PANGOLIN_ENDPOINT")
 	id = os.Getenv("NEWT_ID")
@@ -475,6 +480,13 @@ func runNewtMain(ctx context.Context) {
 		if tel.PrometheusHandler != nil {
 			mux.Handle("/metrics", tel.PrometheusHandler)
 		}
+		// pprof endpoints for profiling
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		logger.Debug("pprof endpoints enabled at /debug/pprof/")
 		admin := &http.Server{
 			Addr:              tcfg.AdminAddr,
 			Handler:           otelhttp.NewHandler(mux, "newt-admin"),
