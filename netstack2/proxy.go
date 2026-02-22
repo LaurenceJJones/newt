@@ -634,17 +634,14 @@ func (p *ProxyHandler) rewritePacketDestination(packet []byte, newDst netip.Addr
 	return pkt
 }
 
-// rewritePacketSource rewrites the source IP in a packet and recalculates checksums (for reverse NAT)
-func (p *ProxyHandler) rewritePacketSource(packet []byte, newSrc netip.Addr) []byte {
+// rewritePacketSourceInPlace rewrites the source IP in-place and recalculates checksums (for reverse NAT).
+// This avoids allocating/copying the packet on the hot path.
+func (p *ProxyHandler) rewritePacketSourceInPlace(packet []byte, newSrc netip.Addr) bool {
 	if len(packet) < header.IPv4MinimumSize {
-		return nil
+		return false
 	}
 
-	// Make a copy to avoid modifying the original
-	pkt := make([]byte, len(packet))
-	copy(pkt, packet)
-
-	ipv4Header := header.IPv4(pkt)
+	ipv4Header := header.IPv4(packet)
 	headerLen := int(ipv4Header.HeaderLength())
 
 	// Rewrite source IP
@@ -660,34 +657,34 @@ func (p *ProxyHandler) rewritePacketSource(packet []byte, newSrc netip.Addr) []b
 	protocol := ipv4Header.TransportProtocol()
 	switch protocol {
 	case header.TCPProtocolNumber:
-		if len(pkt) >= headerLen+header.TCPMinimumSize {
-			tcpHeader := header.TCP(pkt[headerLen:])
+		if len(packet) >= headerLen+header.TCPMinimumSize {
+			tcpHeader := header.TCP(packet[headerLen:])
 			tcpHeader.SetChecksum(0)
 			xsum := header.PseudoHeaderChecksum(
 				header.TCPProtocolNumber,
 				ipv4Header.SourceAddress(),
 				ipv4Header.DestinationAddress(),
-				uint16(len(pkt)-headerLen),
+				uint16(len(packet)-headerLen),
 			)
-			xsum = checksum.Checksum(pkt[headerLen:], xsum)
+			xsum = checksum.Checksum(packet[headerLen:], xsum)
 			tcpHeader.SetChecksum(^xsum)
 		}
 	case header.UDPProtocolNumber:
-		if len(pkt) >= headerLen+header.UDPMinimumSize {
-			udpHeader := header.UDP(pkt[headerLen:])
+		if len(packet) >= headerLen+header.UDPMinimumSize {
+			udpHeader := header.UDP(packet[headerLen:])
 			udpHeader.SetChecksum(0)
 			xsum := header.PseudoHeaderChecksum(
 				header.UDPProtocolNumber,
 				ipv4Header.SourceAddress(),
 				ipv4Header.DestinationAddress(),
-				uint16(len(pkt)-headerLen),
+				uint16(len(packet)-headerLen),
 			)
-			xsum = checksum.Checksum(pkt[headerLen:], xsum)
+			xsum = checksum.Checksum(packet[headerLen:], xsum)
 			udpHeader.SetChecksum(^xsum)
 		}
 	}
 
-	return pkt
+	return true
 }
 
 // ReadOutgoingPacket reads packets from the proxy stack that need to be
@@ -760,9 +757,8 @@ func (p *ProxyHandler) ReadOutgoingPacket() *buffer.View {
 
 			if natEntry != nil {
 				// Perform reverse NAT - rewrite source to original destination
-				packet = p.rewritePacketSource(packet, natEntry.originalDst)
-				if packet != nil {
-					return buffer.NewViewWithData(packet)
+				if p.rewritePacketSourceInPlace(packet, natEntry.originalDst) {
+					return view
 				}
 			}
 		}
