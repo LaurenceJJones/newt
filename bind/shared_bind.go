@@ -139,6 +139,11 @@ type SharedBind struct {
 	// Pre-allocated message buffers for batch operations (Linux only)
 	ipv4Msgs []ipv4.Message
 
+	// Pools for batch send message slices (Linux only).
+	// Using pools avoids per-send allocations and reduces syscall overhead via sendmmsg.
+	ipv4SendMsgsPool sync.Pool // *([]ipv4.Message)
+	ipv6SendMsgsPool sync.Pool // *([]ipv6.Message)
+
 	// Shutdown signal for receive goroutines
 	closeChan chan struct{}
 
@@ -165,6 +170,16 @@ func New(udpConn *net.UDPConn) (*SharedBind, error) {
 		udpConn:         udpConn,
 		netstackPackets: make(chan injectedPacket, 1024), // Larger buffer for better throughput
 		closeChan:       make(chan struct{}),
+	}
+
+	// Init pools (slices are sized to IdealBatchSize; callers may still fall back if larger).
+	bind.ipv4SendMsgsPool.New = func() any {
+		msgs := make([]ipv4.Message, wgConn.IdealBatchSize)
+		return &msgs
+	}
+	bind.ipv6SendMsgsPool.New = func() any {
+		msgs := make([]ipv6.Message, wgConn.IdealBatchSize)
+		return &msgs
 	}
 
 	// Initialize the rebinding condition variable
@@ -482,6 +497,9 @@ func (b *SharedBind) Open(uport uint16) ([]wgConn.ReceiveFunc, uint16, error) {
 		batchSize := wgConn.IdealBatchSize
 		b.ipv4Msgs = make([]ipv4.Message, batchSize)
 		for i := range b.ipv4Msgs {
+			// Avoid per-read allocations: keep a stable 1-element buffer slice.
+			// (WireGuard's StdNetBind does the same.)
+			b.ipv4Msgs[i].Buffers = make([][]byte, 1)
 			b.ipv4Msgs[i].OOB = make([]byte, 0)
 		}
 	}
@@ -604,7 +622,8 @@ func (b *SharedBind) receiveIPv4Batch(pc *ipv4.PacketConn, bufs [][]byte, sizes 
 	}
 
 	for i := 0; i < numBufs; i++ {
-		b.ipv4Msgs[i].Buffers = [][]byte{bufs[i]}
+		// Reuse the pre-allocated 1-element buffer slice.
+		b.ipv4Msgs[i].Buffers[0] = bufs[i]
 	}
 
 	numMsgs, err := pc.ReadBatch(b.ipv4Msgs[:numBufs], 0)
@@ -774,6 +793,11 @@ func (b *SharedBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 		return fmt.Errorf("could not extract destination address from endpoint")
 	}
 
+	// Normalize IPv4-in-IPv6 addresses to match how we store endpoints.
+	if destAddrPort.Addr().Is4In6() {
+		destAddrPort = netip.AddrPortFrom(destAddrPort.Addr().Unmap(), destAddrPort.Port())
+	}
+
 	// Check if this endpoint came from netstack - if so, send through netstack
 	// Use AddrPort directly as key (more efficient than string conversion)
 	if _, isNetstackEndpoint := b.netstackEndpoints.Load(destAddrPort); isNetstackEndpoint {
@@ -796,6 +820,8 @@ func (b *SharedBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 	// Send through the physical UDP socket (for hole-punched clients)
 	b.mu.RLock()
 	conn := b.udpConn
+	pc4 := b.ipv4PC
+	pc6 := b.ipv6PC
 	b.mu.RUnlock()
 
 	if conn == nil {
@@ -804,10 +830,71 @@ func (b *SharedBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 
 	destAddr := net.UDPAddrFromAddrPort(destAddrPort)
 
-	// Send all buffers to the destination
+	// On Linux/Android, use batch sending (sendmmsg) when possible to reduce
+	// syscall count and lock contention inside netpoll/FD write paths.
+	if (runtime.GOOS == "linux" || runtime.GOOS == "android") && len(bufs) > 0 {
+		if destAddrPort.Addr().Is4() && pc4 != nil {
+			msgsPtr := b.ipv4SendMsgsPool.Get().(*[]ipv4.Message)
+			msgCap := cap(*msgsPtr)
+			if len(bufs) <= msgCap {
+				msgs := (*msgsPtr)[:len(bufs)]
+				for i := range bufs {
+					// Reuse the caller-provided [][]byte backing array; avoid allocs.
+					msgs[i].Buffers = bufs[i : i+1]
+					msgs[i].Addr = destAddr
+					msgs[i].OOB = nil
+				}
+				written, err := pc4.WriteBatch(msgs, 0)
+				// Clear references before returning slice to pool to avoid retaining large buffers.
+				for i := range msgs {
+					msgs[i].Buffers = nil
+					msgs[i].Addr = nil
+				}
+				b.ipv4SendMsgsPool.Put(msgsPtr)
+				if err != nil {
+					return err
+				}
+				for i := written; i < len(bufs); i++ {
+					if _, err := conn.WriteToUDP(bufs[i], destAddr); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			b.ipv4SendMsgsPool.Put(msgsPtr)
+		} else if destAddrPort.Addr().Is6() && pc6 != nil {
+			msgsPtr := b.ipv6SendMsgsPool.Get().(*[]ipv6.Message)
+			msgCap := cap(*msgsPtr)
+			if len(bufs) <= msgCap {
+				msgs := (*msgsPtr)[:len(bufs)]
+				for i := range bufs {
+					msgs[i].Buffers = bufs[i : i+1]
+					msgs[i].Addr = destAddr
+					msgs[i].OOB = nil
+				}
+				written, err := pc6.WriteBatch(msgs, 0)
+				for i := range msgs {
+					msgs[i].Buffers = nil
+					msgs[i].Addr = nil
+				}
+				b.ipv6SendMsgsPool.Put(msgsPtr)
+				if err != nil {
+					return err
+				}
+				for i := written; i < len(bufs); i++ {
+					if _, err := conn.WriteToUDP(bufs[i], destAddr); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			b.ipv6SendMsgsPool.Put(msgsPtr)
+		}
+	}
+
+	// Fallback: send all buffers one-by-one.
 	for _, buf := range bufs {
-		_, err := conn.WriteToUDP(buf, destAddr)
-		if err != nil {
+		if _, err := conn.WriteToUDP(buf, destAddr); err != nil {
 			return err
 		}
 	}
