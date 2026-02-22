@@ -81,7 +81,7 @@ func CreateNetTUNWithOptions(localAddresses, dnsServers []netip.Addr, mtu int, o
 		ep:             channel.New(1024, uint32(mtu), ""),
 		stack:          stack.New(stackOpts),
 		events:         make(chan tun.Event, 10),
-		incomingPacket: make(chan *buffer.View),
+		incomingPacket: make(chan *buffer.View, 1024), // Buffered to prevent blocking on packet sends
 		dnsServers:     dnsServers,
 		mtu:            mtu,
 	}
@@ -168,6 +168,7 @@ func (tun *netTun) Events() <-chan tun.Event {
 }
 
 func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
+	// First packet: blocking read
 	view, ok := <-tun.incomingPacket
 	if !ok {
 		return 0, os.ErrClosed
@@ -178,7 +179,30 @@ func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
 		return 0, err
 	}
 	sizes[0] = n
-	return 1, nil
+	count := 1
+
+	// Try to read more packets non-blocking up to batch size
+	for count < len(buf) && count < tunBatchSize {
+		select {
+		case view, ok := <-tun.incomingPacket:
+			if !ok {
+				// Channel closed, return what we have
+				return count, nil
+			}
+			n, err := view.Read(buf[count][offset:])
+			if err != nil {
+				// Return packets we've successfully read
+				return count, nil
+			}
+			sizes[count] = n
+			count++
+		default:
+			// No more packets available, return what we have
+			return count, nil
+		}
+	}
+
+	return count, nil
 }
 
 func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
@@ -210,22 +234,41 @@ func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 }
 
 func (tun *netTun) WriteNotify() {
-	// Handle notifications from main endpoint (NIC 1)
-	pkt := tun.ep.Read()
-	if pkt != nil {
+	// Drain all available packets from both endpoints into the buffered channel.
+	// This is more efficient than reading one packet per notification.
+
+	// Read all available packets from main endpoint (NIC 1)
+	for {
+		pkt := tun.ep.Read()
+		if pkt == nil {
+			break
+		}
 		view := pkt.ToView()
 		pkt.DecRef()
-		tun.incomingPacket <- view
-		return
+
+		// Non-blocking send to buffered channel
+		select {
+		case tun.incomingPacket <- view:
+		default:
+			// Channel full, packet will be dropped
+			// This shouldn't happen often with a 1024 buffer
+		}
 	}
 
-	// Handle notifications from proxy handler if it exists
-	// These are response packets from the proxied connections that need to go back to WireGuard
+	// Read all available packets from proxy handler if it exists
 	if tun.proxyHandler != nil {
-		view := tun.proxyHandler.ReadOutgoingPacket()
-		if view != nil {
-			tun.incomingPacket <- view
-			return
+		for {
+			view := tun.proxyHandler.ReadOutgoingPacket()
+			if view == nil {
+				break
+			}
+
+			// Non-blocking send to buffered channel
+			select {
+			case tun.incomingPacket <- view:
+			default:
+				// Channel full, packet will be dropped
+			}
 		}
 	}
 }
@@ -257,8 +300,12 @@ func (tun *netTun) MTU() (int, error) {
 	return tun.mtu, nil
 }
 
+// BatchSize returns the number of packets that can be read/written in a single call.
+// Using a batch size > 1 reduces syscall overhead significantly at high packet rates.
+const tunBatchSize = 16
+
 func (tun *netTun) BatchSize() int {
-	return 1
+	return tunBatchSize
 }
 
 func convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, tcpip.NetworkProtocolNumber) {
