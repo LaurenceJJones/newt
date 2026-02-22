@@ -126,7 +126,7 @@ func (sl *SubnetLookup) Match(srcIP, dstIP netip.Addr, port uint16, proto tcpip.
 		}
 
 		if rule.DisableIcmp && (proto == header.ICMPv4ProtocolNumber || proto == header.ICMPv6ProtocolNumber) {
-		    // ICMP is disabled for this subnet
+			// ICMP is disabled for this subnet
 			return nil
 		}
 
@@ -159,17 +159,17 @@ func (sl *SubnetLookup) Match(srcIP, dstIP netip.Addr, port uint16, proto tcpip.
 
 // connKey uniquely identifies a connection for NAT tracking
 type connKey struct {
-	srcIP   string
+	srcIP   netip.Addr
 	srcPort uint16
-	dstIP   string
+	dstIP   netip.Addr
 	dstPort uint16
 	proto   uint8
 }
 
 // destKey identifies a destination for handler lookups (without source port since it may change)
 type destKey struct {
-	srcIP   string
-	dstIP   string
+	srcIP   netip.Addr
+	dstIP   netip.Addr
 	dstPort uint16
 	proto   uint8
 }
@@ -190,6 +190,7 @@ type ProxyHandler struct {
 	icmpHandler       *ICMPHandler
 	subnetLookup      *SubnetLookup
 	natTable          map[connKey]*natState
+	natReverseTable   map[connKey]*natState  // Reverse lookup for replies: O(1) in ReadOutgoingPacket
 	destRewriteTable  map[destKey]netip.Addr // Maps original dest to rewritten dest for handler lookups
 	natMu             sync.RWMutex
 	enabled           bool
@@ -215,6 +216,7 @@ func NewProxyHandler(options ProxyHandlerOptions) (*ProxyHandler, error) {
 		enabled:          true,
 		subnetLookup:     NewSubnetLookup(),
 		natTable:         make(map[connKey]*natState),
+		natReverseTable:  make(map[connKey]*natState),
 		destRewriteTable: make(map[destKey]netip.Addr),
 		icmpReplies:      make(chan []byte, 256), // Buffer for ICMP reply packets
 		proxyEp:          channel.New(1024, uint32(options.MTU), ""),
@@ -303,9 +305,18 @@ func (p *ProxyHandler) LookupDestinationRewrite(srcIP, dstIP string, dstPort uin
 		return netip.Addr{}, false
 	}
 
+	srcAddr, err := netip.ParseAddr(srcIP)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	dstAddr, err := netip.ParseAddr(dstIP)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+
 	key := destKey{
-		srcIP:   srcIP,
-		dstIP:   dstIP,
+		srcIP:   srcAddr,
+		dstIP:   dstAddr,
 		dstPort: dstPort,
 		proto:   proto,
 	}
@@ -476,17 +487,17 @@ func (p *ProxyHandler) HandleIncomingPacket(packet []byte) bool {
 
 			// Key using original destination to track the connection
 			key := connKey{
-				srcIP:   srcAddr.String(),
+				srcIP:   srcAddr,
 				srcPort: srcPort,
-				dstIP:   dstAddr.String(),
+				dstIP:   dstAddr,
 				dstPort: dstPort,
 				proto:   uint8(protocol),
 			}
 
 			// Key for handler lookups (doesn't include srcPort for flexibility)
 			dKey := destKey{
-				srcIP:   srcAddr.String(),
-				dstIP:   dstAddr.String(),
+				srcIP:   srcAddr,
+				dstIP:   dstAddr,
 				dstPort: dstPort,
 				proto:   uint8(protocol),
 			}
@@ -517,10 +528,22 @@ func (p *ProxyHandler) HandleIncomingPacket(packet []byte) bool {
 
 				// Store NAT state for this connection
 				p.natMu.Lock()
-				p.natTable[key] = &natState{
+				st := &natState{
 					originalDst: dstAddr,
 					rewrittenTo: newDst,
 				}
+				p.natTable[key] = st
+				// Reverse lookup key for outgoing reply packets:
+				// reply src = rewrittenTo:newDst, reply srcPort = dstPort,
+				// reply dst = original src:srcAddr, reply dstPort = srcPort.
+				rKey := connKey{
+					srcIP:   newDst,
+					srcPort: dstPort,
+					dstIP:   srcAddr,
+					dstPort: srcPort,
+					proto:   uint8(protocol),
+				}
+				p.natReverseTable[rKey] = st
 				// Store destination rewrite for handler lookups
 				p.destRewriteTable[dKey] = newDst
 				p.natMu.Unlock()
@@ -551,7 +574,7 @@ func (p *ProxyHandler) HandleIncomingPacket(packet []byte) bool {
 	}
 
 	// logger.Debug("HandleIncomingPacket: No matching rule for %s -> %s (proto=%d, port=%d)",
-		// srcAddr, dstAddr, protocol, dstPort)
+	// srcAddr, dstAddr, protocol, dstPort)
 	return false
 }
 
@@ -697,6 +720,10 @@ func (p *ProxyHandler) ReadOutgoingPacket() *buffer.View {
 			protocol := ipv4Header.TransportProtocol()
 			headerLen := int(ipv4Header.HeaderLength())
 
+			// Convert gvisor tcpip.Address to netip.Addr without string allocation.
+			srcAddr := netip.AddrFrom4(srcIP.As4())
+			dstAddr := netip.AddrFrom4(dstIP.As4())
+
 			// Extract ports
 			var srcPort, dstPort uint16
 			switch protocol {
@@ -719,20 +746,16 @@ func (p *ProxyHandler) ReadOutgoingPacket() *buffer.View {
 				return view
 			}
 
-			// Look up NAT state for reverse translation
-			// The key uses the original dst (before rewrite), so for replies we need to
-			// find the entry where the rewritten address matches the current source
-			p.natMu.RLock()
-			var natEntry *natState
-			for k, entry := range p.natTable {
-				// Match: reply's dst should be original src, reply's src should be rewritten dst
-				if k.srcIP == dstIP.String() && k.srcPort == dstPort &&
-					entry.rewrittenTo.String() == srcIP.String() && k.dstPort == srcPort &&
-					k.proto == uint8(protocol) {
-					natEntry = entry
-					break
-				}
+			// O(1) reverse NAT lookup (avoid map scan + Address.String allocations).
+			rKey := connKey{
+				srcIP:   srcAddr,
+				srcPort: srcPort,
+				dstIP:   dstAddr,
+				dstPort: dstPort,
+				proto:   uint8(protocol),
 			}
+			p.natMu.RLock()
+			natEntry := p.natReverseTable[rKey]
 			p.natMu.RUnlock()
 
 			if natEntry != nil {
