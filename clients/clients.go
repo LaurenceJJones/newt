@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fosrl/newt/bind"
@@ -29,6 +30,36 @@ import (
 
 	"github.com/fosrl/newt/internal/telemetry"
 )
+
+func getUDPSocketBuffers(conn *net.UDPConn) (rcv, snd int, err error) {
+	// Best-effort; primarily for diagnosing kernel buffer clamping.
+	if conn == nil {
+		return 0, 0, fmt.Errorf("nil conn")
+	}
+	if runtime.GOOS == "windows" {
+		return 0, 0, fmt.Errorf("unsupported on windows")
+	}
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var rcvErr, sndErr error
+	var rcvVal, sndVal int
+	if err := raw.Control(func(fd uintptr) {
+		rcvVal, rcvErr = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+		sndVal, sndErr = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF)
+	}); err != nil {
+		return 0, 0, err
+	}
+	if rcvErr != nil {
+		return 0, 0, rcvErr
+	}
+	if sndErr != nil {
+		return 0, 0, sndErr
+	}
+	return rcvVal, sndVal, nil
+}
 
 type WgConfig struct {
 	IpAddress string   `json:"ipAddress"`
@@ -134,12 +165,24 @@ func NewWireGuardService(interfaceName string, port uint16, mtu int, host string
 
 	// Best-effort: increase UDP socket buffers to reduce kernel drops under load.
 	// The OS may clamp this (e.g. via net.core.rmem_max / wmem_max).
-	const udpSocketBufferBytes = 8 * 1024 * 1024
+	udpSocketBufferBytes := 32 * 1024 * 1024
+	if v := os.Getenv("NEWT_UDP_SOCKET_BUFFER_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			udpSocketBufferBytes = n
+		} else {
+			logger.Warn("Invalid NEWT_UDP_SOCKET_BUFFER_BYTES=%q", v)
+		}
+	}
 	if err := udpConn.SetReadBuffer(udpSocketBufferBytes); err != nil {
 		logger.Warn("Failed to set UDP read buffer: %v", err)
 	}
 	if err := udpConn.SetWriteBuffer(udpSocketBufferBytes); err != nil {
 		logger.Warn("Failed to set UDP write buffer: %v", err)
+	}
+	if rcv, snd, err := getUDPSocketBuffers(udpConn); err == nil {
+		logger.Info("UDP socket buffers: rcv=%d snd=%d (requested=%d)", rcv, snd, udpSocketBufferBytes)
+	} else {
+		logger.Debug("Failed to read UDP socket buffers: %v", err)
 	}
 
 	sharedBind, err := bind.New(udpConn)
