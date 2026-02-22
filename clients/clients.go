@@ -132,6 +132,16 @@ func NewWireGuardService(interfaceName string, port uint16, mtu int, host string
 		return nil, fmt.Errorf("failed to create UDP socket: %v", err)
 	}
 
+	// Best-effort: increase UDP socket buffers to reduce kernel drops under load.
+	// The OS may clamp this (e.g. via net.core.rmem_max / wmem_max).
+	const udpSocketBufferBytes = 8 * 1024 * 1024
+	if err := udpConn.SetReadBuffer(udpSocketBufferBytes); err != nil {
+		logger.Warn("Failed to set UDP read buffer: %v", err)
+	}
+	if err := udpConn.SetWriteBuffer(udpSocketBufferBytes); err != nil {
+		logger.Warn("Failed to set UDP write buffer: %v", err)
+	}
+
 	sharedBind, err := bind.New(udpConn)
 	if err != nil {
 		udpConn.Close()
@@ -277,7 +287,7 @@ func (s *WireGuardService) StartHolepunch(publicKey string, endpoint string, rel
 	}
 
 	if relayPort == 0 {
-	    relayPort = 21820
+		relayPort = 21820
 	}
 
 	// Convert websocket.ExitNode to holepunch.ExitNode
@@ -1043,7 +1053,7 @@ func (s *WireGuardService) processPeerBandwidth(publicKey string, rxBytes, txByt
 					BytesOut:  bytesOutMB,
 				}
 			}
-			
+
 			return nil
 		}
 	}
@@ -1109,9 +1119,9 @@ func (s *WireGuardService) handleAddTarget(msg websocket.WSMessage) {
 		var portRanges []netstack2.PortRange
 		for _, pr := range target.PortRange {
 			portRanges = append(portRanges, netstack2.PortRange{
-				Min: pr.Min,
-				Max: pr.Max,
-				Protocol:    pr.Protocol,
+				Min:      pr.Min,
+				Max:      pr.Max,
+				Protocol: pr.Protocol,
 			})
 		}
 
@@ -1227,9 +1237,9 @@ func (s *WireGuardService) handleUpdateTarget(msg websocket.WSMessage) {
 		var portRanges []netstack2.PortRange
 		for _, pr := range target.PortRange {
 			portRanges = append(portRanges, netstack2.PortRange{
-				Min:         pr.Min,
-				Max:         pr.Max,
-				Protocol:    pr.Protocol,
+				Min:      pr.Min,
+				Max:      pr.Max,
+				Protocol: pr.Protocol,
 			})
 		}
 
