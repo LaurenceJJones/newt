@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,6 +46,9 @@ type netTun struct {
 	events         chan tun.Event
 	notifyHandle   *channel.NotificationHandle
 	incomingPacket chan *buffer.View
+	drainNotify    chan struct{}
+	closeCh        chan struct{}
+	drainWG        sync.WaitGroup
 	mtu            int
 	dnsServers     []netip.Addr
 	hasV4, hasV6   bool
@@ -77,11 +81,22 @@ func CreateNetTUNWithOptions(localAddresses, dnsServers []netip.Addr, mtu int, o
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
 		HandleLocal:        true,
 	}
+
+	// These queues sit on the hot path between gVisor netstack and WireGuard.
+	// If they overflow, packets are dropped which destroys TCP throughput (streaming).
+	// We keep the notify callback non-blocking and apply backpressure in a drain goroutine.
+	const (
+		netstackOutboundQueueSize = 8192
+		wgReadQueueSize           = 8192
+	)
+
 	dev := &netTun{
-		ep:             channel.New(1024, uint32(mtu), ""),
+		ep:             channel.New(netstackOutboundQueueSize, uint32(mtu), ""),
 		stack:          stack.New(stackOpts),
 		events:         make(chan tun.Event, 10),
-		incomingPacket: make(chan *buffer.View, 1024), // Buffered to prevent blocking on packet sends
+		incomingPacket: make(chan *buffer.View, wgReadQueueSize),
+		drainNotify:    make(chan struct{}, 1),
+		closeCh:        make(chan struct{}),
 		dnsServers:     dnsServers,
 		mtu:            mtu,
 	}
@@ -110,8 +125,8 @@ func CreateNetTUNWithOptions(localAddresses, dnsServers []netip.Addr, mtu int, o
 	// Default gVisor buffers are too small (32KB) for high-bandwidth links
 	// At 160 Mbps with 50ms RTT, we need ~1MB buffers (bandwidth-delay product)
 	tcpSendBufOpt := tcpip.TCPSendBufferSizeRangeOption{
-		Min:     64 * 1024,      // 64KB minimum
-		Default: 512 * 1024,     // 512KB default
+		Min:     64 * 1024,       // 64KB minimum
+		Default: 512 * 1024,      // 512KB default
 		Max:     4 * 1024 * 1024, // 4MB maximum
 	}
 	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpSendBufOpt); err != nil {
@@ -119,8 +134,8 @@ func CreateNetTUNWithOptions(localAddresses, dnsServers []netip.Addr, mtu int, o
 	}
 
 	tcpRecvBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
-		Min:     64 * 1024,      // 64KB minimum
-		Default: 512 * 1024,     // 512KB default
+		Min:     64 * 1024,       // 64KB minimum
+		Default: 512 * 1024,      // 512KB default
 		Max:     4 * 1024 * 1024, // 4MB maximum
 	}
 	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecvBufOpt); err != nil {
@@ -138,6 +153,12 @@ func CreateNetTUNWithOptions(localAddresses, dnsServers []netip.Addr, mtu int, o
 	if tcpipErr != nil {
 		return nil, nil, fmt.Errorf("CreateNIC: %v", tcpipErr)
 	}
+
+	dev.drainWG.Add(1)
+	go func() {
+		defer dev.drainWG.Done()
+		dev.drainOutboundToWG()
+	}()
 
 	// Initialize proxy handler after main stack is set up
 	if dev.proxyHandler != nil {
@@ -261,46 +282,63 @@ func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 }
 
 func (tun *netTun) WriteNotify() {
-	// Drain all available packets from both endpoints into the buffered channel.
-	// This is more efficient than reading one packet per notification.
-
-	// Read all available packets from main endpoint (NIC 1)
-	for {
-		pkt := tun.ep.Read()
-		if pkt == nil {
-			break
-		}
-		view := pkt.ToView()
-		pkt.DecRef()
-
-		// Non-blocking send to buffered channel
-		select {
-		case tun.incomingPacket <- view:
-		default:
-			// Channel full, packet will be dropped
-			// This shouldn't happen often with a 1024 buffer
-		}
+	// This callback must stay non-blocking (called from netstack notification path).
+	// We just signal a drain goroutine which can safely block/apply backpressure.
+	select {
+	case tun.drainNotify <- struct{}{}:
+	default:
 	}
+}
 
-	// Read all available packets from proxy handler if it exists
-	if tun.proxyHandler != nil {
+func (tun *netTun) drainOutboundToWG() {
+	for {
+		select {
+		case <-tun.closeCh:
+			return
+		case <-tun.drainNotify:
+		}
+
+		// Drain all available packets from main endpoint (NIC 1)
 		for {
-			view := tun.proxyHandler.ReadOutgoingPacket()
-			if view == nil {
+			pkt := tun.ep.Read()
+			if pkt == nil {
 				break
 			}
+			view := pkt.ToView()
+			pkt.DecRef()
 
-			// Non-blocking send to buffered channel
 			select {
 			case tun.incomingPacket <- view:
-			default:
-				// Channel full, packet will be dropped
+			case <-tun.closeCh:
+				return
+			}
+		}
+
+		// Drain all available packets from proxy handler if it exists
+		if tun.proxyHandler != nil {
+			for {
+				view := tun.proxyHandler.ReadOutgoingPacket()
+				if view == nil {
+					break
+				}
+
+				select {
+				case tun.incomingPacket <- view:
+				case <-tun.closeCh:
+					return
+				}
 			}
 		}
 	}
 }
 
 func (tun *netTun) Close() error {
+	select {
+	case <-tun.closeCh:
+	default:
+		close(tun.closeCh)
+	}
+
 	tun.stack.RemoveNIC(1)
 
 	tun.stack.Close()
@@ -315,6 +353,8 @@ func (tun *netTun) Close() error {
 	if tun.events != nil {
 		close(tun.events)
 	}
+
+	tun.drainWG.Wait()
 
 	if tun.incomingPacket != nil {
 		close(tun.incomingPacket)
