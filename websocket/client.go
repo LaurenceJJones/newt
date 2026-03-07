@@ -43,10 +43,10 @@ type Client struct {
 	writeMux          sync.Mutex
 	clientType        string // Type of client (e.g., "newt", "olm")
 	tlsConfig         TLSConfig
-	metricsCtxMu      sync.RWMutex
-	metricsCtx        context.Context
 	configNeedsSave   bool // Flag to track if config needs to be saved
 	serverVersion     string
+	sessionCtx        context.Context    // Lifecycle of current connection; used for cancellation and telemetry
+	sessionCancel     context.CancelFunc // Cancelled on disconnect/reconnect to stop goroutines
 }
 
 type ClientOption func(*Client)
@@ -90,24 +90,18 @@ func (c *Client) OnTokenUpdate(callback func(token string)) {
 	c.onTokenUpdate = callback
 }
 
-func (c *Client) metricsContext() context.Context {
-	c.metricsCtxMu.RLock()
-	defer c.metricsCtxMu.RUnlock()
-	if c.metricsCtx != nil {
-		return c.metricsCtx
+// sessionContext returns the context for the current connection session (cancellation + telemetry).
+// When connected it is sessionCtx; when not connected it is Background.
+func (c *Client) sessionContext() context.Context {
+	if c.sessionCtx != nil {
+		return c.sessionCtx
 	}
 	return context.Background()
 }
 
-func (c *Client) setMetricsContext(ctx context.Context) {
-	c.metricsCtxMu.Lock()
-	c.metricsCtx = ctx
-	c.metricsCtxMu.Unlock()
-}
-
 // MetricsContext exposes the context used for telemetry emission when a connection is active.
 func (c *Client) MetricsContext() context.Context {
-	return c.metricsContext()
+	return c.sessionContext()
 }
 
 // NewClient creates a new websocket client
@@ -171,6 +165,11 @@ func (c *Client) Close() error {
 		close(c.done)
 	}
 
+	// Cancel session context to signal goroutines to stop
+	if c.sessionCancel != nil {
+		c.sessionCancel()
+	}
+
 	// Set connection status to false
 	c.setConnected(false)
 	telemetry.SetWSConnectionState(false)
@@ -207,7 +206,7 @@ func (c *Client) SendMessage(messageType string, data interface{}) error {
 	if err := c.conn.WriteJSON(msg); err != nil {
 		return err
 	}
-	telemetry.IncWSMessage(c.metricsContext(), "out", "text")
+	telemetry.IncWSMessage(c.sessionContext(), "out", "text")
 	return nil
 }
 
@@ -227,7 +226,7 @@ func (c *Client) SendMessageNoLog(messageType string, data interface{}) error {
 	if err := c.conn.WriteJSON(msg); err != nil {
 		return err
 	}
-	telemetry.IncWSMessage(c.metricsContext(), "out", "text")
+	telemetry.IncWSMessage(c.sessionContext(), "out", "text")
 	return nil
 }
 
@@ -548,14 +547,20 @@ func (c *Client) establishConnection() error {
 
 	telemetry.IncConnAttempt(ctx, "websocket", "success")
 	telemetry.ObserveWSConnectLatency(ctx, lat, "success", "")
+
+	// Cancel any previous session before starting a new one
+	if c.sessionCancel != nil {
+		c.sessionCancel()
+	}
+	c.sessionCtx, c.sessionCancel = context.WithCancel(context.Background())
+
 	c.conn = conn
 	c.setConnected(true)
 	telemetry.SetWSConnectionState(true)
-	c.setMetricsContext(ctx)
 	sessionStart := time.Now()
 	// Wire up pong handler for metrics
 	c.conn.SetPongHandler(func(appData string) error {
-		telemetry.IncWSMessage(c.metricsContext(), "in", "pong")
+		telemetry.IncWSMessage(c.sessionContext(), "in", "pong")
 		return nil
 	})
 
@@ -640,14 +645,28 @@ func (c *Client) setupPKCS12TLS() (*tls.Config, error) {
 	return loadClientCertificate(c.tlsConfig.PKCS12File)
 }
 
+// sessionDone returns a channel that closes when the client is shutting down or the current session is cancelled.
+func (c *Client) sessionDone() <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		select {
+		case <-c.done:
+		case <-c.sessionCtx.Done():
+		}
+		close(ch)
+	}()
+	return ch
+}
+
 // pingMonitor sends pings at a short interval and triggers reconnect on failure
 func (c *Client) pingMonitor() {
+	done := c.sessionDone()
 	ticker := time.NewTicker(c.pingInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-c.done:
+		case <-done:
 			return
 		case <-ticker.C:
 			if c.conn == nil {
@@ -656,19 +675,17 @@ func (c *Client) pingMonitor() {
 			c.writeMux.Lock()
 			err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(c.pingTimeout))
 			if err == nil {
-				telemetry.IncWSMessage(c.metricsContext(), "out", "ping")
+				telemetry.IncWSMessage(c.sessionContext(), "out", "ping")
 			}
 			c.writeMux.Unlock()
 			if err != nil {
-				// Check if we're shutting down before logging error and reconnecting
 				select {
-				case <-c.done:
-					// Expected during shutdown
+				case <-done:
 					return
 				default:
 					logger.Error("Ping failed: %v", err)
-					telemetry.IncWSKeepaliveFailure(c.metricsContext(), "ping_write")
-					telemetry.IncWSReconnect(c.metricsContext(), "ping_write")
+					telemetry.IncWSKeepaliveFailure(c.sessionContext(), "ping_write")
+					telemetry.IncWSReconnect(c.sessionContext(), "ping_write")
 					c.reconnect()
 					return
 				}
@@ -677,25 +694,40 @@ func (c *Client) pingMonitor() {
 	}
 }
 
+// sessionStopReason returns whether the session has been stopped and the reason/result for telemetry.
+func (c *Client) sessionStopReason() (stopped bool, reason, result string) {
+	select {
+	case <-c.done:
+		return true, "shutdown", "success"
+	default:
+	}
+	select {
+	case <-c.sessionCtx.Done():
+		return true, "reconnect", "success"
+	default:
+	}
+	return false, "", ""
+}
+
 // readPumpWithDisconnectDetection reads messages and triggers reconnect on error
 func (c *Client) readPumpWithDisconnectDetection(started time.Time) {
-	ctx := c.metricsContext()
+	ctx := c.sessionContext()
 	disconnectReason := "shutdown"
 	disconnectResult := "success"
 
 	defer func() {
-		if c.conn != nil {
-			c.conn.Close()
-		}
 		if !started.IsZero() {
 			telemetry.ObserveWSSessionDuration(ctx, time.Since(started).Seconds(), disconnectResult)
 		}
 		telemetry.IncWSDisconnect(ctx, disconnectReason, disconnectResult)
-		// Only attempt reconnect if we're not shutting down
 		select {
 		case <-c.done:
-			// Shutting down, don't reconnect
 			return
+		default:
+		}
+		select {
+		case <-c.sessionCtx.Done():
+			return // reconnect already in progress
 		default:
 			telemetry.IncWSReconnect(ctx, disconnectReason)
 			c.reconnect()
@@ -703,55 +735,56 @@ func (c *Client) readPumpWithDisconnectDetection(started time.Time) {
 	}()
 
 	for {
-		select {
-		case <-c.done:
-			disconnectReason = "shutdown"
-			disconnectResult = "success"
+		if stopped, reason, result := c.sessionStopReason(); stopped {
+			disconnectReason, disconnectResult = reason, result
 			return
-		default:
-			var msg WSMessage
-			err := c.conn.ReadJSON(&msg)
-			if err == nil {
-				telemetry.IncWSMessage(c.metricsContext(), "in", "text")
+		}
+		if c.conn == nil {
+			disconnectReason, disconnectResult = "reconnect", "success"
+			return
+		}
+
+		var msg WSMessage
+		err := c.conn.ReadJSON(&msg)
+		if err == nil {
+			telemetry.IncWSMessage(c.sessionContext(), "in", "text")
+		}
+		if err != nil {
+			if stopped, reason, result := c.sessionStopReason(); stopped {
+				disconnectReason, disconnectResult = reason, result
+				return
 			}
-			if err != nil {
-				// Check if we're shutting down before logging error
-				select {
-				case <-c.done:
-					// Expected during shutdown, don't log as error
-					logger.Debug("WebSocket connection closed during shutdown")
-					disconnectReason = "shutdown"
-					disconnectResult = "success"
-					return
-				default:
-					// Unexpected error during normal operation
-					disconnectResult, disconnectReason = classifyWSDisconnect(err)
-					if disconnectResult == "error" {
-						if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
-							logger.Error("WebSocket read error: %v", err)
-						} else {
-							logger.Debug("WebSocket connection closed: %v", err)
-						}
-					}
-					return // triggers reconnect via defer
+			disconnectResult, disconnectReason = classifyWSDisconnect(err)
+			if disconnectResult == "error" {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
+					logger.Error("WebSocket read error: %v", err)
+				} else {
+					logger.Debug("WebSocket connection closed: %v", err)
 				}
 			}
-
-			c.handlersMux.RLock()
-			if handler, ok := c.handlers[msg.Type]; ok {
-				handler(msg)
-			}
-			c.handlersMux.RUnlock()
+			return
 		}
+
+		c.handlersMux.RLock()
+		if handler, ok := c.handlers[msg.Type]; ok {
+			handler(msg)
+		}
+		c.handlersMux.RUnlock()
 	}
 }
 
 func (c *Client) reconnect() {
 	c.setConnected(false)
 	telemetry.SetWSConnectionState(false)
+
+	// Cancel session first so ping/read goroutines see sessionDone() and exit before we close the connection.
+	// We never set c.conn = nil so that goroutines that are still in ReadJSON/WriteControl when we Close()
+	// will get an error from the closed conn instead of a nil pointer panic (see https://github.com/fosrl/newt/issues/176).
+	if c.sessionCancel != nil {
+		c.sessionCancel()
+	}
 	if c.conn != nil {
 		c.conn.Close()
-		c.conn = nil
 	}
 
 	// Only reconnect if we're not shutting down
