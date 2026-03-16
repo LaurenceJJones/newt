@@ -184,7 +184,7 @@ func GetSettings() NetworkSettings {
 }
 
 func GetIncrementor() int {
-	networkSettingsMutex.Lock()
-	defer networkSettingsMutex.Unlock()
+	networkSettingsMutex.RLock()
+	defer networkSettingsMutex.RUnlock()
 	return incrementor
 }
