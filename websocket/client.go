@@ -271,7 +271,8 @@ func (c *Client) SendMessageInterval(messageType string, data interface{}, inter
 	stopChan := make(chan struct{})
 	go func() {
 		count := 0
-		maxAttempts := 10
+		currentInterval := interval
+		maxInterval := 60 * time.Second // Cap the maximum interval
 
 		err := c.SendMessage(messageType, data) // Send immediately
 		if err != nil {
@@ -279,20 +280,27 @@ func (c *Client) SendMessageInterval(messageType string, data interface{}, inter
 		}
 		count++
 
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(currentInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				if count >= maxAttempts {
-					logger.Info("SendMessageInterval timed out after %d attempts for message type: %s", maxAttempts, messageType)
-					return
-				}
 				err = c.SendMessage(messageType, data)
 				if err != nil {
 					logger.Error("Failed to send message: %v", err)
 				}
 				count++
+
+				// Apply exponential backoff after initial attempts
+				// Increase interval every 10 attempts up to maxInterval
+				if count%10 == 0 && currentInterval < maxInterval {
+					currentInterval = time.Duration(float64(currentInterval) * 1.5)
+					if currentInterval > maxInterval {
+						currentInterval = maxInterval
+					}
+					ticker.Reset(currentInterval)
+					logger.Debug("Increased message interval to %v after %d attempts for message type: %s", currentInterval, count, messageType)
+				}
 			case <-stopChan:
 				return
 			}

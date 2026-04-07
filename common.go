@@ -153,12 +153,14 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 
 	stopChan = make(chan struct{})
 	attempt := 1
+	consecutiveFailures := 0
 	retryDelay := initialRetryDelay
 
 	// First try with the initial parameters
 	logger.Debug("Ping attempt %d", attempt)
 	if latency, err := ping(tnet, dst, timeout); err == nil {
 		// Successful ping
+		consecutiveFailures = 0
 		logger.Debug("Ping latency: %v", latency)
 		logger.Info("Tunnel connection to server established successfully!")
 		if healthFile != "" {
@@ -169,6 +171,8 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 		}
 		return stopChan, nil
 	} else {
+		consecutiveFailures++
+		checkExitOnFailure(consecutiveFailures, "initial connection ping")
 		logger.Warn("Ping attempt %d failed: %v", attempt, err)
 	}
 
@@ -184,6 +188,8 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 				logger.Debug("Ping attempt %d", attempt)
 
 				if latency, err := ping(tnet, dst, timeout); err != nil {
+					consecutiveFailures++
+					checkExitOnFailure(consecutiveFailures, "background connection ping")
 					logger.Warn("Ping attempt %d failed: %v", attempt, err)
 
 					// Increase delay after certain thresholds but cap it
@@ -199,6 +205,7 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 					attempt++
 				} else {
 					// Successful ping
+					consecutiveFailures = 0
 					logger.Debug("Ping succeeded after %d attempts", attempt)
 					logger.Debug("Ping latency: %v", latency)
 					logger.Info("Tunnel connection to server established successfully!")
@@ -264,6 +271,7 @@ func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Clien
 				latency, err := reliablePing(tnet, serverIP, adaptiveTimeout, maxAttempts)
 				if err != nil {
 					consecutiveFailures++
+					checkExitOnFailure(consecutiveFailures, "periodic ping health check")
 
 					// Track recent latencies (add a high value for failures)
 					recentLatencies = append(recentLatencies, adaptiveTimeout)
@@ -355,6 +363,16 @@ func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Clien
 	}()
 
 	return pingStopChan
+}
+
+func checkExitOnFailure(consecutiveFailures int, context string) {
+	if !exitOnFailure {
+		return
+	}
+	if consecutiveFailures >= exitOnFailureCount {
+		logger.Error("EXIT_ON_FAILURE enabled: exiting after %d consecutive failures during %s (threshold: %d)", consecutiveFailures, context, exitOnFailureCount)
+		os.Exit(1)
+	}
 }
 
 func parseTargetData(data interface{}) (TargetData, error) {

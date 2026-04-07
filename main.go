@@ -175,6 +175,10 @@ var (
 
 	// Path to config file (overrides CONFIG_FILE env var and default location)
 	configFile string
+
+	// Exit on persistent connection failure (for systemd/docker restarts)
+	exitOnFailure      bool
+	exitOnFailureCount int
 )
 
 // generateChainId generates a random chain ID for deduplicating round-trip messages.
@@ -291,6 +295,19 @@ func runNewtMain(ctx context.Context) {
 	provisioningKey = os.Getenv("NEWT_PROVISIONING_KEY")
 	newtName = os.Getenv("NEWT_NAME")
 	configFile = os.Getenv("CONFIG_FILE")
+	exitOnFailureEnv := os.Getenv("EXIT_ON_FAILURE")
+	if v, parseErr := strconv.ParseBool(exitOnFailureEnv); parseErr == nil {
+		exitOnFailure = v
+	}
+	exitOnFailureCountEnv := os.Getenv("EXIT_ON_FAILURE_COUNT")
+	if exitOnFailureCountEnv != "" {
+		if count, err := strconv.Atoi(exitOnFailureCountEnv); err == nil && count > 0 {
+			exitOnFailureCount = count
+		}
+	}
+	if exitOnFailureCount == 0 {
+		exitOnFailureCount = 30 // Default: exit after 30 consecutive ping failures
+	}
 
 	if endpoint == "" {
 		flag.StringVar(&endpoint, "endpoint", "", "Endpoint of your pangolin server")
@@ -400,6 +417,12 @@ func runNewtMain(ctx context.Context) {
 	}
 	if noCloudEnv == "" {
 		flag.BoolVar(&noCloud, "no-cloud", false, "Disable cloud failover")
+	}
+	if exitOnFailureEnv == "" {
+		flag.BoolVar(&exitOnFailure, "exit-on-failure", false, "Exit the application after persistent connection failures (for systemd/docker restarts)")
+	}
+	if exitOnFailureCountEnv == "" {
+		flag.IntVar(&exitOnFailureCount, "exit-on-failure-count", 30, "Number of consecutive ping failures before exiting (when --exit-on-failure is enabled)")
 	}
 
 	// Metrics/observability flags (mirror ENV if unset)
